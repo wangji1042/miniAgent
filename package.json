@@ -1,0 +1,29 @@
+{
+  "name": "mini-agent",
+  "version": "1.0.0",
+  "description": "教学用最简 TypeScript Agent（TUI）——手写 agent loop，无重型框架",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.tsx",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "ink": "^5.1.0",
+    "ink-text-input": "^6.0.0",
+    "openai": "^4.77.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "keywords": ["agent", "openai", "tui", "typescript", "teaching"],
+  "license": "MIT"
+}
