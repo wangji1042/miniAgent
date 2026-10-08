@@ -21,6 +21,11 @@
  *         result = execute(tool_call)
  *         append { role: "tool", tool_call_id, content: result }
  *       continue  // 带着工具结果再问 LLM
+ *
+ * 流式补充：
+ *   LLM(...) 在流式模式下会「边生成边回调」（文本 delta、工具调用分片），
+ *   本文件把这些回调翻译成 AgentEvent 推给 TUI；但 LLM(...) 的返回值仍是
+ *   一条完整的 assistant 消息，所以下面的工具循环与非流式时一模一样。
  * ============================================================
  */
 
@@ -42,7 +47,12 @@ export interface RunAgentOptions {
   tools: ToolRegistry;
   /** 防止模型死循环调工具；教学默认 8 轮足够 */
   maxIterations?: number;
-  /** 把中间状态推给 TUI（可选） */
+  /**
+   * 把中间状态推给 TUI（可选）
+   * 学习点：流式相关的回调都汇总成事件——
+   *   text_delta（≈ onTextDelta）、tool_call_start（≈ onToolCallStart）、
+   *   tool_end（≈ onToolResult）等，UI 只需一个 switch 即可处理。
+   */
   onEvent?: (event: AgentEvent) => void;
 }
 
@@ -68,12 +78,25 @@ export async function runAgentLoop(options: RunAgentOptions): Promise<string> {
 
     let llmResult;
     try {
-      llmResult = await chatOnce(client, config, messages, toolList);
+      // 第 5 个参数是流式钩子：非流式模式下 llm.ts 不会调用它们
+      llmResult = await chatOnce(client, config, messages, toolList, {
+        onTextDelta: (text) => emit({ type: "text_delta", text }),
+        onToolCallStart: (index, name) => emit({ type: "tool_call_start", index, name }),
+        onToolCallDelta: (index, name, argsLength) =>
+          emit({ type: "tool_call_delta", index, name, argsLength }),
+      });
     } catch (err) {
       const text = err instanceof Error ? err.message : String(err);
       emit({ type: "error", text });
       throw err;
     }
+
+    // 本轮 LLM 输出已完整：通知 UI 归档（流式时把「正在输入」区的文本落入消息列表）
+    emit({
+      type: "llm_turn_end",
+      content: llmResult.message.content ?? "",
+      hasToolCalls: Boolean(llmResult.message.tool_calls?.length),
+    });
 
     // 无论是否要调工具，先把 assistant 消息写入历史
     // 学习点：没有这条消息，后续的 tool 消息就挂不上 tool_call_id。

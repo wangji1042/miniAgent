@@ -79,6 +79,12 @@ export interface LlmConfig {
   apiKey: string;
   baseURL: string;
   model: string;
+  /**
+   * 是否使用流式输出（stream: true）。
+   * 由 OPENAI_STREAM 控制，默认 true；设为 false 可回退到一次性返回，
+   * 适合对「流式 + tool_calls」支持不好的本地端点（如部分 llama.cpp 版本）。
+   */
+  stream: boolean;
 }
 
 /**
@@ -96,11 +102,44 @@ export interface LlmResponse {
   stopReason: StopReason;
 }
 
-/** 供 TUI 展示的事件（loop 通过回调推送，UI 只消费，不直接碰 LLM） */
+/**
+ * 流式钩子：llm.ts 在收到每个 chunk 时调用，loop.ts 再把它们翻译成 AgentEvent。
+ * 学习点：llm.ts 不认识 UI，只认识「来了一段文本」「某个工具调用在长大」这种协议级事实。
+ */
+export interface StreamHooks {
+  /** 收到一段助手文本增量（delta.content） */
+  onTextDelta?: (text: string) => void;
+  /** 第一次得知某个工具调用的名字（流式中 name 通常只在首个分片出现） */
+  onToolCallStart?: (index: number, name: string) => void;
+  /** 某个工具调用的 arguments 又拼上了一段；argsLength 为目前累计长度 */
+  onToolCallDelta?: (index: number, name: string, argsLength: number) => void;
+}
+
+/**
+ * 供 TUI 展示的事件（loop 通过回调推送，UI 只消费，不直接碰 LLM）
+ *
+ * 一轮 LLM 调用中，事件的典型顺序：
+ *   status → text_delta × N →（可选）tool_call_start / tool_call_delta × N → llm_turn_end
+ *   → 若有工具：tool_start → tool_end（每个工具一对）→ 下一轮 status …
+ *   → 最终：done
+ */
 export type AgentEvent =
   | { type: "status"; text: string }
-  | { type: "assistant_delta"; text: string }
+  /** 流式文本增量：TUI 逐字追加到「正在输入」区域 */
+  | { type: "text_delta"; text: string }
+  /** 模型开始生成某个工具调用（此时参数还没生成完，不能执行） */
+  | { type: "tool_call_start"; index: number; name: string }
+  /** 工具调用参数生成进度（用于展示 write_file 这类长参数的进度） */
+  | { type: "tool_call_delta"; index: number; name: string; argsLength: number }
+  /**
+   * 一次 LLM 调用结束（流已读完 / 非流式响应已返回）。
+   * TUI 收到后把本轮完整文本归档进消息列表，并清空「正在输入」区域。
+   */
+  | { type: "llm_turn_end"; content: string; hasToolCalls: boolean }
+  /** 开始在本地执行工具（参数已完整） */
   | { type: "tool_start"; name: string; args: string; id: string }
+  /** 工具执行完毕，结果即将以 role=tool 写回 messages */
   | { type: "tool_end"; name: string; result: string; id: string }
   | { type: "error"; text: string }
+  /** 整个 agent loop 结束 */
   | { type: "done"; finalText: string };

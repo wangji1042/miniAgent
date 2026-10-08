@@ -13,6 +13,7 @@
 - OpenAI **兼容** Chat Completions（可改 `baseURL` 指向 DeepSeek / 本地 vLLM / Ollama 等）
 - 手写 Agent 循环（`src/agent/loop.ts`）
 - 终端 TUI（ink + React）：对话流 + 工具调用状态
+- **流式输出**（默认开启）：逐字显示回复，正确拼接流式 `tool_calls`；可用 `OPENAI_STREAM=false` 关闭
 - 内置 4 个示例工具：
   - `get_current_time` — 当前时间
   - `calculator` — 安全四则运算（手写解析器，不用 `Function`/`eval`）
@@ -51,6 +52,7 @@ cp .env.example .env
 | `OPENAI_API_KEY` | 是 | API Key；本地兼容服务可填任意非空字符串 |
 | `OPENAI_BASE_URL` | 否 | 默认 `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | 否 | 默认 `gpt-4o-mini`，按服务商改名 |
+| `OPENAI_STREAM` | 否 | 默认 `true`；设为 `false` 回退非流式（见下文） |
 
 **不要把真实 Key 提交到 Git**（`.gitignore` 已忽略 `.env`）。
 
@@ -111,9 +113,27 @@ miniAgent/
       components/
         MessageList.tsx
         InputBox.tsx
+        StreamingReply.tsx   # 流式草稿区（逐字渲染）
 ```
 
 更细的运行原理见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+
+## 流式输出
+
+默认 `OPENAI_STREAM=true`：请求带 `stream: true`，服务端通过 SSE 一块块推送 `delta`，
+TUI 在消息列表下方的「草稿区」逐字显示；本轮结束后归档为一条 Agent 消息。
+模型生成工具调用时，会显示「模型正在生成工具调用：xxx」以及参数生成进度（`write_file` 写大文件时很直观）。
+
+关闭流式（例如某些 llama.cpp 版本对「流式 + 工具调用」支持不好，表现为工具参数为空或报错）：
+
+```bash
+# .env
+OPENAI_STREAM=false
+```
+
+可接受的值：`true/false`、`1/0`、`yes/no`、`on/off`（大小写不敏感）。启动后首行状态会显示 `stream: on/off`。
+
+原理（SSE、delta、`tool_calls` 按 `index` 拼接）见 [ARCHITECTURE.md 第 6.1 节](./ARCHITECTURE.md)。
 
 ## 写文件安全边界（`write_file`）
 
@@ -128,7 +148,7 @@ miniAgent/
 
 1. 先读 `src/agent/types.ts`，弄清四种 `role`
 2. 再读 `src/agent/loop.ts` 的伪代码注释与 `for` 循环
-3. 对照 `llm.ts` 看一次 API 请求如何组装
+3. 对照 `llm.ts` 看一次 API 请求如何组装；再读 `chatStream` 理解流式分片拼接
 4. 打开 TUI，问一个会触发工具的问题，观察终端里的「调用工具 / 工具结果」行
 5. 读 `ARCHITECTURE.md` 里的 mermaid 图，把整条数据流串起来
 

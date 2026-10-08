@@ -15,11 +15,11 @@
 |------|------|------|
 | 入口 | `src/index.tsx` | 加载 `.env`、创建客户端与工具、`render(<App />)` |
 | 类型 | `src/agent/types.ts` | `Message` / `ToolCall` / `AgentEvent` 等 |
-| LLM 客户端 | `src/agent/llm.ts` | 一次 Chat Completions 调用 + 响应规范化 |
+| LLM 客户端 | `src/agent/llm.ts` | 一次 Chat Completions 调用（流式 / 非流式）+ 分片拼接 + 响应规范化 |
 | Agent Loop | `src/agent/loop.ts` | 多轮：调模型 → 执行工具 → 写回 → 再调 |
 | 工具注册表 | `src/agent/tools/index.ts` | 注册 / 查找 / 列出工具 |
 | 具体工具 | `time.ts` / `calculator.ts` / `readFile.ts` / `writeFile.ts` | 可调用能力实现 |
-| TUI | `src/tui/App.tsx` 等 | 输入、对话流、工具状态展示 |
+| TUI | `src/tui/App.tsx` 等 | 输入、对话流、工具状态展示；`StreamingReply` 逐字渲染当前回复 |
 
 ## 3. Agent Loop 伪代码
 
@@ -57,6 +57,9 @@ function runAgentLoop(messages, tools):
 | `finish_reason` / stop reason | `LlmResponse.stopReason` | `stop`=最终文本；`tool_calls`=还需跑工具；`length`=截断 |
 | `tools`（API 参数） | `toApiTools(registry.list())` | 给模型看的工具 JSON Schema 列表 |
 | `tool_choice` | `llm.ts` 里设为 `auto` | 让模型自己决定是否调用工具 |
+| `stream: true` / SSE | `chatStream` | 响应以多条 `data: {chunk}` 推送，以 `data: [DONE]` 结束 |
+| `delta` | `chunk.choices[0].delta` | 每个 chunk 只带「增量」：一段 `content` 或若干 `tool_calls` 碎片 |
+| `tool_calls[].index` | `chatStream` 中的槽位 Map | 标明碎片属于第几个工具调用；按它归并 `id` / `name` / `arguments` |
 
 ### 四种 role 速记
 
@@ -72,14 +75,14 @@ tool       → 某个 tool_call 的执行结果（不是模型说的话）
 ```mermaid
 flowchart TB
   subgraph Entry["入口"]
-    Index["index.tsx\\n dotenv + 组装"]
+    Index["index.tsx<br/>dotenv + 组装"]
   end
 
   subgraph AgentCore["Agent 核心"]
-    Types["types.ts\\n Message / ToolCall"]
-    LLM["llm.ts\\n chatOnce"]
-    Loop["loop.ts\\n runAgentLoop"]
-    Registry["tools/index.ts\\n ToolRegistry"]
+    Types["types.ts<br/>Message / ToolCall"]
+    LLM["llm.ts<br/>chatOnce"]
+    Loop["loop.ts<br/>runAgentLoop"]
+    Registry["tools/index.ts<br/>ToolRegistry"]
     T1["time.ts"]
     T2["calculator.ts"]
     T3["readFile.ts"]
@@ -90,6 +93,7 @@ flowchart TB
     App["App.tsx"]
     ML["MessageList"]
     IB["InputBox"]
+    SR["StreamingReply"]
   end
 
   subgraph External["外部"]
@@ -102,6 +106,7 @@ flowchart TB
   App --> Loop
   App --> ML
   App --> IB
+  App --> SR
   Loop --> LLM
   Loop --> Registry
   Registry --> T1
@@ -150,6 +155,101 @@ sequenceDiagram
   TUI->>User: 渲染 Agent 最终回复
 ```
 
+## 6.1 流式输出（stream: true）
+
+### 为什么要流式
+
+非流式时，模型生成完整回答（可能十几秒）后才一次性返回，终端一直空白。
+流式时，服务端用 **SSE（Server-Sent Events）** 边生成边推送，TUI 可以逐字显示。
+
+### 线上的数据长什么样
+
+```
+data: {"choices":[{"delta":{"role":"assistant","content":"我先"}}]}
+data: {"choices":[{"delta":{"content":"算一下。"}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"calculator","arguments":""}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"expre"}}]}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ssion\":\"1+2\"}"}}]}}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+```
+
+### 拼接规则（`chatStream`）
+
+| 字段 | 规则 | 原因 |
+|------|------|------|
+| `delta.content` | 按到达顺序追加 | 文本就是被切开的字符串 |
+| `tool_calls[i].index` | 作为槽位键 | 多个工具调用的碎片可能交错到达 |
+| `id` | 首次出现时赋值（不追加） | 通常只在第一个碎片里出现 |
+| `function.name` | 空则赋值；相同则忽略；否则追加 | 兼容「只发一次 / 重复发送 / 切碎发送」三种端点行为 |
+| `function.arguments` | 一律追加 | JSON 字符串被任意切开；**流结束前不是合法 JSON，不能执行** |
+| `finish_reason` | 记录最后一个非空值 | 一般只在最后一个有效 chunk 上出现 |
+| `choices: []` | 跳过 | 部分端点末尾会推一个只带 usage 的 chunk |
+
+流读完后，槽位按 `index` 排序，组装成与非流式**完全同构**的 `assistant` 消息，
+所以 `loop.ts` 的工具循环一行都不用改——流式只是「等待期间多了实时回调」。
+
+### 事件对照（loop → TUI）
+
+| 事件 | 含义 | TUI 行为 |
+|------|------|----------|
+| `text_delta` | 一段文本增量（≈ onTextDelta） | 追加到 `StreamingReply` 草稿区 |
+| `tool_call_start` | 模型开始生成某个工具调用（≈ onToolCallStart） | 打一行状态提示 |
+| `tool_call_delta` | 工具参数生成进度 | 草稿区下方显示「生成 write_file 参数中… N 字符」 |
+| `llm_turn_end` | 本次 LLM 调用结束 | 收起草稿区；中间轮次的说明文字归档 |
+| `tool_start` / `tool_end` | 本地执行工具 / 拿到结果（≈ onToolResult） | 黄色 / 紫色工具行 |
+| `done` | 整个 loop 结束 | 最终回复归档到消息列表 |
+
+### 开关
+
+`OPENAI_STREAM=false` 时 `chatOnce` 走 `chatNonStream`，不会产生 `text_delta`，
+其余事件（`llm_turn_end` / `tool_*` / `done`）照常，UI 行为一致，只是没有逐字效果。
+
+### Mermaid：流式时序
+
+```mermaid
+sequenceDiagram
+  actor User as 用户
+  participant TUI as App / StreamingReply
+  participant Loop as runAgentLoop
+  participant LLM as chatStream
+  participant API as OpenAI 兼容端点（SSE）
+  participant Tools as ToolRegistry
+
+  User->>TUI: 输入问题并回车
+  TUI->>Loop: messages.push(user)；runAgentLoop()
+  Loop->>LLM: chatOnce(messages, tools, hooks)
+  LLM->>API: POST /chat/completions (stream: true)
+
+  loop 每个 SSE chunk
+    API-->>LLM: data: {delta}
+    alt delta.content
+      LLM-->>Loop: hooks.onTextDelta(text)
+      Loop-->>TUI: text_delta
+      TUI->>TUI: 草稿区追加文字（逐字渲染）
+    else delta.tool_calls[index]
+      LLM->>LLM: 按 index 拼接 id / name / arguments
+      LLM-->>Loop: onToolCallStart / onToolCallDelta
+      Loop-->>TUI: tool_call_start / tool_call_delta
+    end
+  end
+
+  API-->>LLM: finish_reason + data: [DONE]
+  LLM-->>Loop: 完整 assistant 消息（与非流式同构）
+  Loop-->>TUI: llm_turn_end（收起草稿区）
+
+  alt 有 tool_calls
+    Loop->>Tools: execute(name, JSON.parse(arguments))
+    Tools-->>Loop: result
+    Loop-->>TUI: tool_start / tool_end
+    Loop->>Loop: messages.push(role=tool)
+    Loop->>LLM: 下一轮 chatStream（重复上面的流程）
+  else 最终文本
+    Loop-->>TUI: done(finalText)
+    TUI->>User: 归档为一条 Agent 消息
+  end
+```
+
 ## 7. 一次典型对话在 messages 里长什么样
 
 用户问：「现在几点？算一下 1+2」
@@ -195,6 +295,6 @@ sequenceDiagram
 ## 9. 扩展练习（可选）
 
 1. 新增工具 `list_dir`：同样限制在项目根内。
-2. 给 `chatOnce` 加 streaming，用 `assistant_delta` 事件做打字机效果。
+2. 用 ink 的 `<Static>` 渲染已归档消息，长对话流式刷新时减少整屏重绘闪烁。
 3. 把 `maxIterations` 做成 `.env` 配置。
 4. 将 tool 结果做摘要后再写回，观察对长文件场景的影响。
